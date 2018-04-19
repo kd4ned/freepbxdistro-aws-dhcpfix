@@ -1,4 +1,13 @@
 #!/bin/bash
+#
+####################################################
+# Fix for FreePBX Distro (SNG7) DHCP on Amazon EC2 #
+####################################################
+#
+# https://github.com/kd4ned/freepbxdistro-aws-dhcpfix
+#  (c)2018 Jeremy Gault / Voiceopia Communications <jeremy@voiceopia.com>
+# You are free to use this script as needed.
+#
 dhconfig() {
     if [ -n "${old_ip_address}" ] && [ -n "${alias_ip_address}" ] &&
        [ ! "${alias_ip_address}" = "${old_ip_address}" ]; then
