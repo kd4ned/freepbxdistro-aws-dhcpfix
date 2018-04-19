@@ -1,0 +1,249 @@
+#!/bin/bash
+dhconfig() {
+    if [ -n "${old_ip_address}" ] && [ -n "${alias_ip_address}" ] &&
+       [ ! "${alias_ip_address}" = "${old_ip_address}" ]; then
+        # possible new alias, remove old alias first
+        ip -4 addr del ${old_ip_address} dev ${interface} label ${interface}:0
+    fi
+
+    if [ -n "${old_ip_address}" ] &&
+       [ ! "${old_ip_address}" = "${new_ip_address}" ]; then
+        # IP address changed. Delete all routes, and clear the ARP cache.
+        flush_dev ${interface}
+    fi
+
+    # make sure the interface is up
+    ip link set dev ${interface} up
+
+    # replace = add if it doesn't exist or override (update lifetimes) if it's there
+    ip -4 addr replace ${new_ip_address}/${new_prefix} broadcast ${new_broadcast_address} dev ${interface} >/dev/null 2>&1
+
+
+    if [ "${reason}" = "BOUND" ] || [ "${reason}" = "REBOOT" ] ||
+       [ ! "${old_ip_address}" = "${new_ip_address}" ] ||
+       [ ! "${old_subnet_mask}" = "${new_subnet_mask}" ] ||
+       [ ! "${old_network_number}" = "${new_network_number}" ] ||
+       [ ! "${old_broadcast_address}" = "${new_broadcast_address}" ] ||
+       [ ! "${old_routers}" = "${new_routers}" ] ||
+       [ ! "${old_interface_mtu}" = "${new_interface_mtu}" ]; then
+        
+        # The 576 MTU is only used for X.25 and dialup connections
+        # where the admin wants low latency.  Such a low MTU can cause
+        # problems with UDP traffic, among other things.  As such,
+        # disallow MTUs from 576 and below by default, so that broken
+        # MTUs are ignored, but higher stuff is allowed (1492, 1500, etc).
+        if [ -n "${new_interface_mtu}" ] && [ ${new_interface_mtu} -gt 576 ]; then
+            ip link set dev ${interface} mtu ${new_interface_mtu}
+        fi
+
+        # static routes
+        if [ -n "${new_classless_static_routes}" ] ||
+           [ -n "${new_static_routes}" ]; then
+            if [ -n "${new_classless_static_routes}" ]; then
+                IFS=', |' static_routes=(${new_classless_static_routes})
+		# If the DHCP server returns both a Classless Static Routes option and
+                # a Router option, the DHCP client MUST ignore the Router option. (RFC3442)
+                new_routers=""
+            else
+                IFS=', |' static_routes=(${new_static_routes})
+            fi
+            route_targets=()
+
+            for((i=0; i<${#static_routes[@]}; i+=2)); do
+                target=${static_routes[$i]}
+                if [ -n "${new_classless_static_routes}" ]; then
+		    if [ ${target} = "0" ]; then
+                        new_routers="${static_routes[$i+1]}"
+                        continue
+                    else
+                        prefix=${target%%.*}
+                        target=${target#*.}
+                        IFS="." target_arr=(${target})
+                        unset IFS
+                        ((pads=4-${#target_arr[@]}))
+                        for j in $(seq $pads); do
+                            target="${target}.0"
+                        done
+
+                        # Client MUST zero any bits in the subnet number where the corresponding bit in the mask is zero.
+                        # In other words, the subnet number installed in the routing table is the logical AND of
+                        # the subnet number and subnet mask given in the Classless Static Routes option. (RFC3442)
+                        target="$(get_network_address ${target} ${prefix})"
+                    fi
+                else
+                    prefix=$(class_bits ${target})
+                fi
+                gateway=${static_routes[$i+1]}
+
+                # special case 0.0.0.0 to allow static routing for link-local addresses
+                # (including IPv4 multicast) which will not have a next-hop (#769463, #787318)
+                if [ "${gateway}" = "0.0.0.0" ]; then
+                    valid_gateway=0
+                    scope='scope link'
+                else
+                    is_router_reachable ${gateway}
+                    valid_gateway=$?
+                    scope=''
+                fi
+                if [ ${valid_gateway} -eq 0 ]; then
+                    metric=''
+                    for t in ${route_targets[@]}; do
+                        if [ ${t} = ${target} ]; then
+                            if [ -z "${metric}" ]; then
+                                metric=1
+                            else
+                                ((metric=metric+1))
+                            fi
+                        fi
+                    done
+
+                    if [ -n "${metric}" ]; then
+                        metric="metric ${metric}"
+                    fi
+
+                    ip -4 route replace ${target}/${prefix} proto static via ${gateway} dev ${interface} ${metric} ${scope}
+
+                    if [ $? -ne 0 ]; then
+                        logmessage "failed to create static route: ${target}/${prefix} via ${gateway} dev ${interface} ${metric}"
+                    else
+                        route_targets=(${route_targets[@]} ${target})
+                    fi
+                fi
+            done
+        fi
+
+        # gateways
+        if [[ ( "${DEFROUTE}" != "no" ) &&
+              (( -z "${GATEWAYDEV}" ) || ( "${GATEWAYDEV}" = "${interface}" )) ]]; then
+            if [[ ( -z "$GATEWAY" ) ||
+                  (( -n "$DHCLIENT_IGNORE_GATEWAY" ) && ( "$DHCLIENT_IGNORE_GATEWAY" = [Yy]* )) ]]; then
+                metric="${METRIC:-}"
+                let i="${METRIC:-0}"
+                default_routers=()
+
+                for router in ${new_routers} ; do
+                    added_router=-
+
+                    for r in ${default_routers[@]} ; do
+                        if [ "${r}" = "${router}" ]; then
+                            added_router=1
+                        fi
+                    done
+
+                    if [ -z "${router}" ] ||
+                       [ "${added_router}" = "1" ] ||
+                       [ $(IFS=. ip2num ${router}) -le 0 ] ||
+                       [[ ( "${router}" = "${new_broadcast_address}" ) &&
+                          ( "${new_subnet_mask}" != "255.255.255.255" ) ]]; then
+                        continue
+                    fi
+
+                    default_routers=(${default_routers[@]} ${router})
+                    add_default_gateway ${router} ${metric}
+                    let i=i+1
+                    metric=${i}
+                done
+            elif [ -n "${GATEWAY}" ]; then
+                routersubnet=$(get_network_address ${GATEWAY} ${new_subnet_mask})
+                mysubnet=$(get_network_address ${new_ip_address} ${new_subnet_mask})
+
+                if [ "${routersubnet}" = "${mysubnet}" ]; then
+                    ip -4 route replace default via ${GATEWAY} dev ${interface}
+                fi
+            fi
+        fi
+    fi
+
+    if [ ! "${new_ip_address}" = "${alias_ip_address}" ] &&
+       [ -n "${alias_ip_address}" ]; then
+        # Reset the alias address (fix: this should really only do this on changes)
+        ip -4 addr flush dev ${interface} label ${interface}:0 >/dev/null 2>&1
+        ip -4 addr replace ${alias_ip_address}/${alias_prefix} broadcast ${alias_broadcast_address} dev ${interface} label ${interface}:0
+        ip -4 route replace ${alias_ip_address}/32 dev ${interface}
+    fi
+    
+    # After dhclient brings an interface UP with a new IP address, subnet mask, 
+    # and routes, in the REBOOT/BOUND states -> search for "dhclient-up-hooks".
+    if [ "${reason}" = "BOUND" ] || [ "${reason}" = "REBOOT" ] ||
+       [ ! "${old_ip_address}" = "${new_ip_address}" ] ||
+       [ ! "${old_subnet_mask}" = "${new_subnet_mask}" ] ||
+       [ ! "${old_network_number}" = "${new_network_number}" ] ||
+       [ ! "${old_broadcast_address}" = "${new_broadcast_address}" ] ||
+       [ ! "${old_routers}" = "${new_routers}" ] ||
+       [ ! "${old_interface_mtu}" = "${new_interface_mtu}" ]; then
+        
+        if [ -x ${ETCDIR}/dhclient-${interface}-up-hooks ]; then
+            . ${ETCDIR}/dhclient-${interface}-up-hooks
+        elif [ -x ${ETCDIR}/dhclient-up-hooks ]; then
+            . ${ETCDIR}/dhclient-up-hooks
+        fi
+    fi
+
+    make_resolv_conf
+
+    if [ -n "${new_host_name}" ] && need_hostname; then
+        hostname ${new_host_name} || echo "See -nc option in dhclient(8) man page."
+    fi
+
+    if [[ ( "${DHCP_TIME_OFFSET_SETS_TIMEZONE}" = [yY1]* ) &&
+          ( -n "${new_time_offset}" ) ]]; then
+        # DHCP option "time-offset" is requested by default and should be
+        # handled.  The geographical zone abbreviation cannot be determined
+        # from the GMT offset, but the $ZONEINFO/Etc/GMT$offset file can be
+        # used - note: this disables DST.
+        ((z=new_time_offset/3600))
+        ((hoursWest=$(printf '%+d' $z)))
+
+        if (( $hoursWest < 0 )); then
+            # tzdata treats negative 'hours west' as positive 'gmtoff'!
+            ((hoursWest*=-1))
+        fi
+
+        tzfile=/usr/share/zoneinfo/Etc/GMT$(printf '%+d' ${hoursWest})
+        if [ -e ${tzfile} ]; then
+            cp -fp ${tzfile} /etc/localtime
+            touch /etc/localtime
+        fi
+    fi
+
+    execute_client_side_configuration_scripts "config"
+}
+
+# Section 18.1.8. (Receipt of Reply Messages) of RFC 3315 says:
+# The client SHOULD perform duplicate address detection on each of
+# the addresses in any IAs it receives in the Reply message before
+# using that address for traffic.
+add_ipv6_addr_with_DAD() {
+            ip -6 addr replace ${new_ip6_address}/${new_ip6_prefixlen} \
+                dev ${interface} scope global
+
+            # repeatedly test whether newly added address passed
+            # duplicate address detection (DAD)
+            for i in $(seq 5); do
+                sleep 1 # give the DAD some time
+
+                addr=$(ip -6 addr show dev ${interface} \
+                       | grep ${new_ip6_address}/${new_ip6_prefixlen})
+
+                # tentative flag == DAD is still not complete
+                tentative=$(echo "${addr}" | grep tentative)
+                # dadfailed flag == address is already in use somewhere else
+                dadfailed=$(echo "${addr}" | grep dadfailed)
+
+                if [ -n "${dadfailed}" ] ; then
+                    # address was added with valid_lft/preferred_lft 'forever', remove it
+                    ip -6 addr del ${new_ip6_address}/${new_ip6_prefixlen} dev ${interface}
+                    exit_with_hooks 3
+                fi
+                if [ -z "${tentative}" ] ; then
+                    if [ -n "${addr}" ]; then
+                        # DAD is over
+                        return 0
+                    else
+                        # address was auto-removed (or not added at all)
+                        exit_with_hooks 3
+                    fi
+                fi
+            done
+            return 0
+}
